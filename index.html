@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OxiTick API</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.17.14/swagger-ui.min.css">
+<style>
+  body { margin: 0; background: #fafafa; }
+  .topbar { display: none; }
+  header.oxi {
+    padding: 18px 24px;
+    background: #0a0e16;
+    color: #e7e9ee;
+    font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  header.oxi strong { color: #ff8f39; }
+  header.oxi a { color: #78adff; }
+  header.oxi p { margin: 6px 0 0; opacity: .85; font-size: 13px; }
+</style>
+</head>
+<body>
+<header class="oxi">
+  <strong>OxiTick Server API</strong>
+  <p>
+    Self-hosted sync for a private, offline-first to-do and notes app &middot;
+    <a href="https://oxitick.com">oxitick.com</a> &middot;
+    <a href="https://hub.docker.com/r/oxisoft/oxitick">Docker Hub</a> &middot;
+    <a href="https://github.com/oxisoft/oxitick">Docs repo</a> &middot;
+    <a href="https://github.com/oxisoft/oxitick-mcp">MCP server</a>
+  </p>
+</header>
+<div id="swagger-ui"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.17.14/swagger-ui-bundle.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.17.14/swagger-ui-standalone-preset.min.js"></script>
+<script>
+  // Both this page and the spec sit at the repository root, and GitHub Pages is
+  // configured to serve from the root rather than /docs — so the published URL
+  // is the one the README advertises and the spec is a sibling.
+  //
+  // Serving from /docs would make that directory the site root, and a spec one
+  // level above it would be outside the published site entirely: the page would
+  // load and the spec would 404.
+  //
+  // "Try it out" is a different matter: it calls whichever server you pick, from
+  // this origin, so that server has to allow it. OxiTick sends
+  // Access-Control-Allow-Origin: * and advertises PATCH among its allowed
+  // methods, so a normal deployment works. A proxy in front of it that strips
+  // CORS headers will not.
+  window.ui = SwaggerUIBundle({
+    url: 'openapi.yaml',
+    dom_id: '#swagger-ui',
+    deepLinking: true,
+    presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset],
+    layout: 'BaseLayout',
+    docExpansion: 'none',
+    defaultModelsExpandDepth: 0,
+    tryItOutEnabled: true,
+    persistAuthorization: false,
+  });
+</script>
+</body>
+</html>

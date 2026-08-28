@@ -1,0 +1,3335 @@
+openapi: 3.0.3
+info:
+  title: OxiTick API
+  description: |
+    OxiTick server is a self-hosted Golang backend for the OxiTick offline-first todo/note application.
+    
+    ## Features
+    - **Pure Go**: No CGO dependencies, cross-platform compatible
+    - **SQLite Database**: Embedded database with automatic migrations
+    - **Delta Sync**: Efficient table-by-table synchronization
+    - **Multi-Factor Auth**: JWT tokens with optional TOTP support
+    - **Invitation System**: Share lists with other users
+    - **Device Management**: Track and manage multiple devices per user
+    
+    ## Authentication
+    Most endpoints require JWT authentication via Bearer token in the Authorization header:
+    ```
+    Authorization: Bearer <your-jwt-token>
+    ```
+    
+    ## Sync Algorithm
+    The server implements delta synchronization:
+    1. Client sends last sync timestamp for specific table
+    2. Server returns all records modified after timestamp
+    3. Client pushes local changes to server
+    4. Conflict resolution using last-write-wins with timestamp comparison
+    5. Access control ensures users can only sync their own data
+    
+    ## Sync Order
+    Tables should be synced in this order to maintain referential integrity:
+    1. `devices` (user's devices)
+    2. `tags` (user's tags) 
+    3. `lists` (user's owned lists)
+    4. `items` (items from user's lists)
+    5. `subitems` (subitems from user's items)
+    6. `item_tags` (tags on user's items)
+  version: 1.3.0
+  contact:
+    name: OxiTick Support
+    url: https://github.com/oxisoft/oxitick
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:15773
+    description: A container started with the documented `docker run`
+  - url: https://your-oxitick-server
+    description: Your own deployment, behind whatever hostname you gave it
+
+tags:
+  - name: Authentication
+    description: User authentication and session management
+  - name: Device Management
+    description: Device registration and management
+  - name: Data Synchronization
+    description: Delta sync operations for offline-first functionality
+  - name: Invitations
+    description: List sharing and invitation management
+  - name: Utilities
+    description: Helper endpoints and health checks
+  - name: App Tokens
+    description: |
+      Long-lived bearer credentials for software rather than people — an AI
+      assistant over MCP, a script. Managed with a session; never usable to
+      manage themselves.
+  - name: Personal Data
+    description: |
+      An account's own lists and tasks, as resources. The only surface an app
+      token can reach.
+
+      Lists are read-only here: there is deliberately no endpoint that creates,
+      renames, archives or deletes one. Everything writable is a task or a
+      subtask, every write names a single id, and the one batch endpoint takes
+      explicit ids with a hard cap.
+  - name: Two-Factor Authentication
+    description: TOTP enrolment and removal
+  - name: Device Pairing
+    description: Signing a new device in by QR code, approved from a signed-in one
+  - name: Shared Lists
+    description: |
+      Lists that live only on the server and are edited by several people at
+      once. Separate from the personal, offline-first tables in every way: no
+      sync, no last-write-wins, and every mutable row carries a version that a
+      write is conditional on.
+  - name: Notifications
+    description: Activity on shared lists
+  - name: Subscription
+    description: Premium entitlement status
+
+paths:
+  /health:
+    get:
+      tags:
+        - Utilities
+      summary: Health check
+      description: Returns server health status
+      responses:
+        '200':
+          description: Server is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+                  timestamp:
+                    type: string
+                    format: date-time
+
+  # There is no /api/v1/auth/register. Accounts are created by an
+  # administrator through the admin panel; the server exposes no public sign-up.
+
+  /api/v1/auth/login:
+    post:
+      tags:
+        - Authentication
+      summary: User login
+      description: Authenticate user and return JWT tokens
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '400':
+          description: Invalid request data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/auth/refresh:
+    post:
+      tags:
+        - Authentication
+      summary: Refresh access token
+      description: Get new access token using refresh token
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: Token refreshed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefreshResponse'
+        '400':
+          description: Invalid request data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Invalid refresh token
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/users/search:
+    get:
+      tags:
+        - Utilities
+      summary: Search users
+      description: Search for users by username or email for sharing purposes
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: q
+          in: query
+          required: true
+          description: Search query (username or email)
+          schema:
+            type: string
+            minLength: 2
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SearchUsersResponse'
+        '400':
+          description: Invalid search query
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/devices:
+    get:
+      tags:
+        - Device Management
+      summary: List user devices
+      description: Get all devices registered for the current user
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: List of user devices
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetDevicesResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/devices/register:
+    post:
+      tags:
+        - Device Management
+      summary: Register new device
+      description: Register a new device for the current user
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterDeviceRequest'
+      responses:
+        '201':
+          description: Device registered successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegisterDeviceResponse'
+        '400':
+          description: Invalid request data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Device already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/devices/{id}:
+    put:
+      tags:
+        - Device Management
+      summary: Update device
+      description: Update device information
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Device ID
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateDeviceRequest'
+      responses:
+        '200':
+          description: Device updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateDeviceResponse'
+        '400':
+          description: Invalid request data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Device not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    delete:
+      tags:
+        - Device Management
+      summary: Delete device
+      description: Delete a device (cannot delete the device being used for the request)
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Device ID
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Device deleted successfully
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Cannot delete current device
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Device not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/sync/{table}/delta:
+    get:
+      tags:
+        - Data Synchronization
+      summary: Get changes since last sync
+      description: |
+        Retrieve all records from the specified table that have been modified since the last sync timestamp.
+        
+        **Valid tables**: devices, tags, lists, items, subitems, item_tags
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: table
+          in: path
+          required: true
+          description: Table name to sync
+          schema:
+            type: string
+            enum: [devices, tags, lists, items, subitems, item_tags]
+        - name: last_sync
+          in: query
+          required: true
+          description: Last sync timestamp in RFC3339 format
+          schema:
+            type: string
+            format: date-time
+            example: "2023-12-01T10:00:00Z"
+        - name: device_id
+          in: query
+          required: true
+          description: Device ID requesting the sync
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Delta sync data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncResponse'
+        '400':
+          description: Invalid request parameters
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/sync/{table}/apply:
+    post:
+      tags:
+        - Data Synchronization
+      summary: Apply local changes to server
+      description: |
+        Send local changes to the server for the specified table. The server will handle conflict resolution
+        using last-write-wins based on timestamps.
+        
+        **Valid tables**: devices, tags, lists, items, subitems, item_tags
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: table
+          in: path
+          required: true
+          description: Table name to apply changes to
+          schema:
+            type: string
+            enum: [devices, tags, lists, items, subitems, item_tags]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ApplyRequest'
+      responses:
+        '200':
+          description: Changes applied successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApplyResponse'
+        '400':
+          description: Invalid request data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Access denied to some records
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/files/limits:
+    get:
+      tags:
+        - File Attachments
+      summary: Upload limits for the calling user
+      description: |
+        What this server will accept, so the app can refuse an over-size or
+        unsupported file at the moment it is picked rather than at upload time.
+
+        The app imposes no limit of its own — an account with no server is not
+        limited at all — so this is the only source of the size cap. The cap is
+        per-user: free and premium accounts differ.
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: The caller's limits
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  max_file_size:
+                    type: integer
+                    format: int64
+                    description: Maximum size of a single upload, in bytes
+                    example: 10485760
+                  allowed_types:
+                    type: array
+                    description: Canonical MIME types this server accepts
+                    items:
+                      type: string
+                    example: ["image/png", "application/pdf", "text/markdown"]
+                  allowed_extensions:
+                    type: array
+                    description: The same set as file extensions, for the file picker
+                    items:
+                      type: string
+                    example: [".png", ".pdf", ".md"]
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/files/upload:
+    post:
+      tags:
+        - File Attachments
+      summary: Upload an attachment's bytes
+      description: |
+        Stores the binary for a file record. The metadata row travels over
+        `/api/v1/sync/files/apply` like any other record; this endpoint carries
+        only the content.
+
+        `file_id` is generated by the client so that a record created offline
+        and its bytes share one identity. It must be a UUID.
+
+        The file's type is decided from its extension *and* its content, which
+        have to agree — a renamed file is refused. Allowed: PNG, JPEG, GIF,
+        WebP, BMP, HEIC/HEIF, PDF, plain text, CSV, Markdown, ZIP and 7z.
+        Microsoft Office formats and unidentified binaries are not accepted.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                file_id:
+                  type: string
+                  format: uuid
+                  description: |
+                    The id the bytes are stored under. Omit to have the server
+                    generate one. Must be a UUID, and must belong to the caller
+                    if a record with that id already exists.
+      responses:
+        '200':
+          description: The stored file record
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/File'
+        '400':
+          description: |
+            No file, an empty file, a file over the size limit, a type that is
+            not allowed, content that does not match the extension, or a
+            `file_id` that is not a UUID.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: A record with that id exists and belongs to someone else
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/files/{fileId}/download:
+    get:
+      tags:
+        - File Attachments
+      summary: Download an attachment's bytes
+      description: |
+        Available to the file's owner, and to anyone with an accepted permission
+        on a list containing an item the file is attached to.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: fileId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The file's contents
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Access denied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: No such file, or its bytes were never uploaded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/files/{fileId}:
+    delete:
+      tags:
+        - File Attachments
+      summary: Soft-delete a file
+      description: |
+        Marks the record deleted so other devices learn about it through sync.
+        The bytes are kept for now; reclaiming them needs a grace period across
+        offline devices.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: fileId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Deleted
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Only the owner may delete a file
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: No such file
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/invitations/pending:
+    get:
+      tags:
+        - Invitations
+      summary: Get pending invitations
+      description: Retrieve all pending invitations for the current user
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: List of pending invitations
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PendingInvitationsResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/invitations/sent:
+    get:
+      tags:
+        - Invitations
+      summary: Get sent invitations
+      description: Retrieve all invitations sent by the current user
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: List of sent invitations
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SentInvitationsResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/invitations/{id}/accept:
+    put:
+      tags:
+        - Invitations
+      summary: Accept invitation
+      description: Accept a pending invitation to access a shared list
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Invitation ID
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Invitation accepted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "Invitation accepted successfully"
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Invitation not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/invitations/{id}/decline:
+    put:
+      tags:
+        - Invitations
+      summary: Decline invitation
+      description: Decline a pending invitation to access a shared list
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Invitation ID
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Invitation declined successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message:
+                    type: string
+                    example: "Invitation declined successfully"
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Invitation not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/lists/{id}/invite:
+    post:
+      tags:
+        - Invitations
+      summary: Invite user to list
+      description: Send an invitation to another user to share access to a list
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: List ID
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InviteRequest'
+      responses:
+        '201':
+          description: Invitation sent successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InviteResponse'
+        '400':
+          description: Invalid request data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          description: Not the list owner
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: List or user not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '409':
+          description: Invitation already exists
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  # ---------------------------------------------------------------------------
+  # App tokens
+  #
+  # Session-authenticated throughout. An app token cannot reach these routes, by
+  # design: a credential able to mint its own successors could not be revoked.
+  # ---------------------------------------------------------------------------
+  /api/v1/tokens:
+    get:
+      tags: [App Tokens]
+      summary: List app tokens
+      description: |
+        Newest first, revoked ones included — "this credential existed and is
+        now off" is different information from "this never existed".
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: The account's tokens
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tokens:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/AppToken'
+                  api_enabled:
+                    type: boolean
+                    description: |
+                      Whether app tokens work on this installation at all. An
+                      administrator can switch the whole feature off from the
+                      console; existing tokens are then refused with 503 but are
+                      not revoked, and resume when it is switched back on.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [App Tokens]
+      summary: Create an app token
+      description: |
+        Returns the secret, which exists in this response and nowhere else ever
+        again.
+
+        The account password is required even though the request is already
+        authenticated. A session lasts hours and expires on its own; an app token
+        is indefinite and does not, so without the step-up an unlocked device
+        converts into a credential that outlives every other mitigation the
+        account has — including changing the password. When two-factor is on, a
+        code is required as well.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, password]
+              properties:
+                name:
+                  type: string
+                  maxLength: 64
+                  description: Your own label, shown in the app's list
+                  example: Claude on my laptop
+                scope:
+                  type: string
+                  enum: [read, write, delete]
+                  default: read
+                  description: |
+                    Cumulative. Anything unrecognised is treated as `read`.
+                expires_in_days:
+                  type: integer
+                  description: Omit or 0 for no expiry, which is the default
+                  example: 90
+                password:
+                  type: string
+                  description: The account password
+                totp_code:
+                  type: string
+                  description: Required when the account has two-factor enabled
+      responses:
+        '201':
+          description: Created. The `secret` is shown once.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    $ref: '#/components/schemas/AppToken'
+                  secret:
+                    type: string
+                    description: The credential itself. Store it now.
+                    example: oxt_7Kd2QaX8vN3mPqR5tY9wZ1bC4eF6gH0jK2lM8nO4pQs
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: The password or two-factor code was wrong
+        '409':
+          description: The account already holds the maximum number of tokens
+    parameters: []
+  /api/v1/tokens/{tokenId}:
+    delete:
+      tags: [App Tokens]
+      summary: Revoke an app token
+      description: |
+        Takes effect on the token's next request, with no cache in between. No
+        password is asked for: switching a credential off is the safe direction
+        and should be the easy one.
+
+        A token belonging to another account answers 404, exactly as one that
+        does not exist — the two are deliberately indistinguishable.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: tokenId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Revoked
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  revoked:
+                    type: boolean
+        '404':
+          description: No such token on this account
+
+  # ---------------------------------------------------------------------------
+  # Personal data — the app-token surface
+  # ---------------------------------------------------------------------------
+  /api/v1/personal/me:
+    get:
+      tags: [Personal Data]
+      summary: What this token may do
+      description: |
+        A token asking about itself. Not a privilege escalation — it learns
+        nothing it could not discover by attempting things, and no endpoint
+        anywhere lets a token change its own scope.
+
+        It exists so a client can register only the capabilities it actually
+        has, instead of probing with a write. The only probe for delete access
+        would be a deletion.
+      security:
+        - AppTokenAuth: []
+      responses:
+        '200':
+          description: This token's own capabilities
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token_name:
+                    type: string
+                  scope:
+                    type: string
+                    enum: [read, write, delete]
+                  can_write:
+                    type: boolean
+                  can_delete:
+                    type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '503':
+          $ref: '#/components/responses/AppAPIDisabled'
+  /api/v1/personal/lists:
+    get:
+      tags: [Personal Data]
+      summary: List your lists
+      description: |
+        Archived lists are excluded unless asked for. Lists closed to the API are
+        never returned at all, and cannot be made to appear by any parameter.
+      security:
+        - AppTokenAuth: []
+      parameters:
+        - name: include_archived
+          in: query
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Your lists
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  lists:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/PersonalList'
+                  total:
+                    type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/AppAPIDisabled'
+  /api/v1/personal/lists/{id}:
+    get:
+      tags: [Personal Data]
+      summary: Get one list
+      description: |
+        Reachable by id even when archived. A list closed to the API answers 404,
+        identical to one that does not exist — a refusal that distinguished them
+        would confirm the list exists.
+      security:
+        - AppTokenAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PersonalList'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/personal/lists/{id}/items:
+    get:
+      tags: [Personal Data]
+      summary: List the tasks in a list
+      security:
+        - AppTokenAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - $ref: '#/components/parameters/TaskCompleted'
+        - $ref: '#/components/parameters/TaskDueBefore'
+        - $ref: '#/components/parameters/TaskDueAfter'
+        - $ref: '#/components/parameters/TaskOverdue'
+        - $ref: '#/components/parameters/TaskImportanceMin'
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          $ref: '#/components/responses/TaskPage'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Personal Data]
+      summary: Add a task to a list
+      description: |
+        Into a list that already exists. There is no endpoint that creates the
+        list too: software that cannot find somewhere to put a task should say
+        so rather than inventing a new place for it.
+      security:
+        - AppTokenAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title]
+              properties:
+                title:
+                  type: string
+                  maxLength: 500
+                content:
+                  type: string
+                  maxLength: 100000
+                note_type:
+                  type: string
+                  enum: [todo, note]
+                  default: todo
+                importance:
+                  type: integer
+                  minimum: 0
+                  maximum: 4
+                due_at:
+                  type: string
+                  description: RFC3339 UTC to the second, e.g. 2026-09-01T09:00:00Z
+      responses:
+        '201':
+          description: The created task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PersonalTask'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/ScopeInsufficient'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/personal/items:
+    get:
+      tags: [Personal Data]
+      summary: Search tasks across every list
+      description: |
+        The read behind "what is due today", "what is overdue" and "find the task
+        about X".
+
+        `content` is truncated in this response — see `content_truncated`. Fetch
+        a task by id for the whole body. Two hundred full markdown notes is tens
+        of megabytes on the wire and, for an assistant, an entire context window
+        spent on one call.
+      security:
+        - AppTokenAuth: []
+      parameters:
+        - name: q
+          in: query
+          description: |
+            Free text over title and body. Minimum two characters. The term's own
+            `%` and `_` are escaped, so a search for `%` finds tasks containing a
+            percent sign rather than every task on the account.
+          schema:
+            type: string
+        - name: list_id
+          in: query
+          schema:
+            type: string
+        - $ref: '#/components/parameters/TaskCompleted'
+        - $ref: '#/components/parameters/TaskDueBefore'
+        - $ref: '#/components/parameters/TaskDueAfter'
+        - $ref: '#/components/parameters/TaskOverdue'
+        - $ref: '#/components/parameters/TaskImportanceMin'
+        - name: include_archived
+          in: query
+          schema:
+            type: boolean
+            default: false
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+      responses:
+        '200':
+          $ref: '#/components/responses/TaskPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '503':
+          $ref: '#/components/responses/AppAPIDisabled'
+  /api/v1/personal/items/{itemId}:
+    get:
+      tags: [Personal Data]
+      summary: Get one task, whole
+      description: The only endpoint that returns the full body and the subtasks.
+      security:
+        - AppTokenAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ItemId'
+      responses:
+        '200':
+          description: The task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PersonalTask'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [Personal Data]
+      summary: Edit a task
+      description: |
+        One task, by id. Every field is optional and omitting one leaves it
+        alone — so editing a title cannot blank a note the caller never read.
+
+        `list_id` moves the task to another list. The destination is checked
+        exactly as the source was, so a task cannot be moved into a list closed
+        to the API.
+      security:
+        - AppTokenAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ItemId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title:
+                  type: string
+                  maxLength: 500
+                content:
+                  type: string
+                  maxLength: 100000
+                note_type:
+                  type: string
+                  enum: [todo, note]
+                importance:
+                  type: integer
+                  minimum: 0
+                  maximum: 4
+                due_at:
+                  type: string
+                  description: Empty string clears the due date
+                is_pinned:
+                  type: boolean
+                list_id:
+                  type: string
+      responses:
+        '200':
+          description: The updated task
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PersonalTask'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/ScopeInsufficient'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Personal Data]
+      summary: Delete a task
+      description: |
+        A soft delete: the row is marked deleted, which is how a deletion reaches
+        other devices at all, and leaves the task recoverable in the app. There
+        is no hard delete anywhere on this surface and no batch form of this
+        endpoint.
+
+        Requires the `delete` scope, which is separate from `write` on purpose.
+      security:
+        - AppTokenAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ItemId'
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: string
+                  deleted:
+                    type: boolean
+        '403':
+          $ref: '#/components/responses/ScopeInsufficient'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/personal/items/{itemId}/completion:
+    post:
+      tags: [Personal Data]
+      summary: Complete or un-complete a task
+      security:
+        - AppTokenAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ItemId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [completed]
+              properties:
+                completed:
+                  type: boolean
+      responses:
+        '200':
+          description: Updated
+        '403':
+          $ref: '#/components/responses/ScopeInsufficient'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/personal/items/completion:
+    post:
+      tags: [Personal Data]
+      summary: Complete or un-complete up to 25 tasks
+      description: |
+        The only endpoint on this surface that takes more than one id, and it
+        takes them explicitly: there is deliberately no filter form. A
+        filter-shaped mutation is how one wrong inference becomes a hundred wrong
+        rows, whereas an id list keeps a mistake proportional to what the caller
+        actually looked at.
+
+        Results are per id. An id the caller may not have is reported
+        `not_found` and the rest still apply.
+      security:
+        - AppTokenAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [ids, completed]
+              properties:
+                ids:
+                  type: array
+                  maxItems: 25
+                  items:
+                    type: string
+                completed:
+                  type: boolean
+      responses:
+        '200':
+          description: Per-id outcomes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                        status:
+                          type: string
+                          enum: [updated, not_found, error]
+                  completed:
+                    type: boolean
+        '400':
+          description: No ids given, or more than 25
+        '403':
+          $ref: '#/components/responses/ScopeInsufficient'
+  /api/v1/personal/items/{itemId}/subitems:
+    post:
+      tags: [Personal Data]
+      summary: Add a subtask
+      security:
+        - AppTokenAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ItemId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [title]
+              properties:
+                title:
+                  type: string
+                  maxLength: 500
+      responses:
+        '201':
+          description: The created subtask
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PersonalSubtask'
+        '403':
+          $ref: '#/components/responses/ScopeInsufficient'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/personal/subitems/{subitemId}:
+    patch:
+      tags: [Personal Data]
+      summary: Rename a subtask
+      security:
+        - AppTokenAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SubitemId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title:
+                  type: string
+                  maxLength: 500
+      responses:
+        '200':
+          description: Updated
+        '403':
+          $ref: '#/components/responses/ScopeInsufficient'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Personal Data]
+      summary: Delete a subtask
+      description: Soft, as everywhere on this surface. Requires the `delete` scope.
+      security:
+        - AppTokenAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SubitemId'
+      responses:
+        '200':
+          description: Deleted
+        '403':
+          $ref: '#/components/responses/ScopeInsufficient'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/v1/personal/subitems/{subitemId}/completion:
+    post:
+      tags: [Personal Data]
+      summary: Complete or un-complete a subtask
+      security:
+        - AppTokenAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SubitemId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [completed]
+              properties:
+                completed:
+                  type: boolean
+      responses:
+        '200':
+          description: Updated
+        '403':
+          $ref: '#/components/responses/ScopeInsufficient'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ---------------------------------------------------------------------------
+  # Account security
+  # ---------------------------------------------------------------------------
+  /api/v1/auth/password:
+    post:
+      tags: [Authentication]
+      summary: Change your own password
+      description: |
+        The current password is always required: an unlocked device left on a
+        desk is exactly the position an attacker would change a password from.
+
+        Every other session on the account is signed out, except the one that
+        made the change.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password:
+                  type: string
+                new_password:
+                  type: string
+                  minLength: 8
+                totp_code:
+                  type: string
+      responses:
+        '200':
+          description: Changed
+        '401':
+          description: The current password or two-factor code was wrong
+  /api/v1/auth/totp/status:
+    get:
+      tags: [Two-Factor Authentication]
+      summary: Whether two-factor is on
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Status
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled:
+                    type: boolean
+  /api/v1/auth/totp/setup:
+    post:
+      tags: [Two-Factor Authentication]
+      summary: Begin enrolment
+      description: Returns a secret and an otpauth URL. Nothing is enabled until it is confirmed.
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Enrolment material
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  secret:
+                    type: string
+                  otpauth_url:
+                    type: string
+  /api/v1/auth/totp/enable:
+    post:
+      tags: [Two-Factor Authentication]
+      summary: Confirm enrolment with a code
+      description: |
+        Returns one-time backup codes, shown once. Every other session on the
+        account is signed out, so a session that predates two-factor cannot
+        outlive it.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code:
+                  type: string
+      responses:
+        '200':
+          description: Enabled
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  backup_codes:
+                    type: array
+                    items:
+                      type: string
+        '400':
+          description: The code did not verify
+  /api/v1/auth/totp/disable:
+    post:
+      tags: [Two-Factor Authentication]
+      summary: Turn two-factor off
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code:
+                  type: string
+                  description: A current code, or a backup code
+      responses:
+        '200':
+          description: Disabled
+        '400':
+          description: The code did not verify
+  /api/v1/auth/subscription:
+    get:
+      tags: [Subscription]
+      summary: Premium entitlement for this account
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Status
+  /api/v1/auth/subscription/test:
+    post:
+      tags: [Subscription]
+      summary: Toggle premium for testing
+      description: |
+        **Temporary.** Only works on a server started with
+        `PREMIUM_TEST_TOGGLE=1`, and exists to exercise premium behaviour across
+        platforms before purchasing is real. It will be removed.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                premium:
+                  type: boolean
+      responses:
+        '200':
+          description: Toggled
+
+  # ---------------------------------------------------------------------------
+  # Signing a device in by QR code
+  # ---------------------------------------------------------------------------
+  /api/v1/auth/pairing:
+    post:
+      tags: [Device Pairing]
+      summary: Mint a pairing code to display as a QR
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: The code and its expiry
+  /api/v1/auth/pairing/{id}:
+    get:
+      tags: [Device Pairing]
+      summary: Poll a pairing you started
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Its current state
+    delete:
+      tags: [Device Pairing]
+      summary: Cancel a pairing you started
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Cancelled
+  /api/v1/auth/pairing/{id}/approve:
+    post:
+      tags: [Device Pairing]
+      summary: Approve a scanned pairing
+      description: |
+        Only the device that minted the code may approve it — not merely another
+        device on the same account. Scanning alone signs nothing in, which is
+        what makes a photographed QR code worthless on its own.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Approved
+  /api/v1/auth/pairing/{id}/deny:
+    post:
+      tags: [Device Pairing]
+      summary: Deny a scanned pairing
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Denied
+  /api/v1/auth/pairing/claim:
+    post:
+      tags: [Device Pairing]
+      summary: Claim a scanned code
+      description: Unauthenticated — this is the new device, which has no session yet.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code:
+                  type: string
+                device_name:
+                  type: string
+                platform:
+                  type: string
+      responses:
+        '200':
+          description: Claimed; now waiting for approval
+  /api/v1/auth/pairing/wait:
+    post:
+      tags: [Device Pairing]
+      summary: Wait for the other device to approve
+      description: Long-polls. Unauthenticated, like the claim it follows.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code:
+                  type: string
+      responses:
+        '200':
+          description: The pairing's state
+  /api/v1/auth/pairing/complete:
+    post:
+      tags: [Device Pairing]
+      summary: Exchange an approved code for a session
+      description: Spends the code; it cannot be replayed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [code]
+              properties:
+                code:
+                  type: string
+                totp_code:
+                  type: string
+      responses:
+        '200':
+          description: A session, as from login
+
+  # ---------------------------------------------------------------------------
+  # Devices
+  # ---------------------------------------------------------------------------
+  /api/v1/devices/{id}/revoke:
+    post:
+      tags: [Device Management]
+      summary: Disconnect a device
+      description: |
+        Takes effect immediately: its tokens stop working on their next request.
+        Signing in again on that device re-attaches it, deliberately — a mistaken
+        tap must be recoverable.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Disconnected
+  /api/v1/devices/{id}/wipe:
+    post:
+      tags: [Device Management]
+      summary: Disconnect a device and ask it to erase its local copy
+      description: |
+        Revocation is immediate; the wipe cannot be, because it has to run on
+        hardware that may never come back. That asymmetry is why both exist:
+        revoking protects the account, wiping is the best effort at the data.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Disconnected, wipe requested
+  /api/v1/devices/wipe/confirm:
+    post:
+      tags: [Device Management]
+      summary: Report that a device erased its local copy
+      description: |
+        Called by the wiped device itself, carrying the token it was refused
+        with — every other route refuses it, so this is the only contact it can
+        make. Turns "wipe pending" into "wiped" in the owner's device list.
+      responses:
+        '200':
+          description: Recorded
+  /api/v1/sync/changes:
+    get:
+      tags: [Data Synchronization]
+      summary: Has anything changed for me?
+      description: |
+        A cheap probe so an idle client does not pull every table on a timer.
+        Optionally long-polls.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: device_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: last_sync
+          in: query
+          schema:
+            type: string
+        - name: wait
+          in: query
+          description: Seconds to hold the request open waiting for a change
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Per-table change counts
+
+  # ---------------------------------------------------------------------------
+  # Notifications
+  # ---------------------------------------------------------------------------
+  /api/v1/notifications:
+    get:
+      tags: [Notifications]
+      summary: Activity on your shared lists
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Notifications
+  /api/v1/notifications/read-all:
+    post:
+      tags: [Notifications]
+      summary: Mark everything read
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Marked
+  /api/v1/notifications/{notificationId}/read:
+    post:
+      tags: [Notifications]
+      summary: Mark one read
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: notificationId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Marked
+
+  # ---------------------------------------------------------------------------
+  # Shared lists
+  #
+  # Server-only state, edited by several people at once. Every mutable row
+  # carries a `version`; a write sends the version it was built from and is
+  # rejected rather than silently winning if that version has moved on.
+  #
+  # App tokens cannot reach any of this. Roles are ordered integers:
+  # 0 Viewer, 1 Doer, 2 Editor, 3 Manager, 4 Owner.
+  # ---------------------------------------------------------------------------
+  /api/v1/shared/all:
+    get:
+      tags: [Shared Lists]
+      summary: Every shared list and its contents in one call
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Everything the caller can see
+  /api/v1/shared/changes:
+    get:
+      tags: [Shared Lists]
+      summary: What changed since a cursor
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Changes
+  /api/v1/shared/smart/{view}:
+    get:
+      tags: [Shared Lists]
+      summary: A date-based view across shared lists
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: view
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The view
+  /api/v1/shared/presence:
+    post:
+      tags: [Shared Lists]
+      summary: Report that you are looking at a list
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Recorded
+    delete:
+      tags: [Shared Lists]
+      summary: Stop reporting presence
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Released
+  /api/v1/shared/pins:
+    post:
+      tags: [Shared Lists]
+      summary: Pin or unpin an item for yourself
+      description: A pin is one person's arrangement of a view, never shared with the list.
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Set
+  /api/v1/shared/view-settings:
+    put:
+      tags: [Shared Lists]
+      summary: Save your own filter and sort for a shared list
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Saved
+  /api/v1/shared/lists:
+    get:
+      tags: [Shared Lists]
+      summary: Shared lists you are in
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Lists
+    post:
+      tags: [Shared Lists]
+      summary: Create a shared list
+      description: The creator becomes its Owner.
+      security:
+        - BearerAuth: []
+      responses:
+        '201':
+          description: Created
+  /api/v1/shared/lists/{id}:
+    get:
+      tags: [Shared Lists]
+      summary: One shared list
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The list
+    patch:
+      tags: [Shared Lists]
+      summary: Edit a shared list
+      description: Conditional on `version`; a stale write is reported rather than applied.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Updated
+        '409':
+          description: Someone else changed it first
+    delete:
+      tags: [Shared Lists]
+      summary: Delete a shared list
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Deleted
+  /api/v1/shared/lists/{id}/items:
+    post:
+      tags: [Shared Lists]
+      summary: Add an item to a shared list
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '201':
+          description: Created
+  /api/v1/shared/lists/{id}/leave:
+    post:
+      tags: [Shared Lists]
+      summary: Leave a shared list
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Left
+  /api/v1/shared/lists/{id}/members:
+    get:
+      tags: [Shared Lists]
+      summary: Who is in a shared list
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Members
+    post:
+      tags: [Shared Lists]
+      summary: Invite someone
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Invited
+  /api/v1/shared/lists/{id}/members/{userId}:
+    patch:
+      tags: [Shared Lists]
+      summary: Change a member's role
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Changed
+    delete:
+      tags: [Shared Lists]
+      summary: Remove a member
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Removed
+  /api/v1/shared/items/{itemId}:
+    patch:
+      tags: [Shared Lists]
+      summary: Edit a shared item
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ItemId'
+      responses:
+        '200':
+          description: Updated
+        '409':
+          description: Someone else changed it first
+    delete:
+      tags: [Shared Lists]
+      summary: Delete a shared item
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ItemId'
+      responses:
+        '200':
+          description: Deleted
+  /api/v1/shared/items/{itemId}/completion:
+    post:
+      tags: [Shared Lists]
+      summary: Complete or un-complete a shared item
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ItemId'
+      responses:
+        '200':
+          description: Updated
+  /api/v1/shared/items/{itemId}/restore:
+    post:
+      tags: [Shared Lists]
+      summary: Undelete a shared item
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ItemId'
+      responses:
+        '200':
+          description: Restored
+  /api/v1/shared/items/{itemId}/subitems:
+    post:
+      tags: [Shared Lists]
+      summary: Add a subitem to a shared item
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ItemId'
+      responses:
+        '201':
+          description: Created
+  /api/v1/shared/items/{itemId}/files:
+    post:
+      tags: [Shared Lists]
+      summary: Attach a file to a shared item
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/ItemId'
+      requestBody:
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        '201':
+          description: Attached
+  /api/v1/shared/subitems/{subitemId}:
+    patch:
+      tags: [Shared Lists]
+      summary: Edit a shared subitem
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SubitemId'
+      responses:
+        '200':
+          description: Updated
+    delete:
+      tags: [Shared Lists]
+      summary: Delete a shared subitem
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SubitemId'
+      responses:
+        '200':
+          description: Deleted
+  /api/v1/shared/subitems/{subitemId}/completion:
+    post:
+      tags: [Shared Lists]
+      summary: Complete or un-complete a shared subitem
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/SubitemId'
+      responses:
+        '200':
+          description: Updated
+  /api/v1/shared/files/{fileId}:
+    get:
+      tags: [Shared Lists]
+      summary: Download a shared attachment
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: fileId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: The file
+    delete:
+      tags: [Shared Lists]
+      summary: Delete a shared attachment
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: fileId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Deleted
+  /api/v1/shared/invitations/{id}/accept:
+    post:
+      tags: [Shared Lists]
+      summary: Accept an invitation to a shared list
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Accepted
+  /api/v1/shared/invitations/{id}/decline:
+    post:
+      tags: [Shared Lists]
+      summary: Decline an invitation to a shared list
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Declined
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        A session token from `/auth/login` or `/auth/refresh`. Short-lived and
+        refreshable; this is what the apps use for everything.
+    AppTokenAuth:
+      type: http
+      scheme: bearer
+      description: |
+        An app token: `oxt_` followed by 43 characters, created in the app under
+        Settings → Security and shown exactly once.
+
+        Deliberately weaker than a session. It is accepted **only** on
+        `/api/v1/personal/*` — never on `/auth`, `/devices`, `/sync`, `/shared`,
+        `/tokens` or the admin console — so a leaked token cannot change a
+        password, disable two-factor, wipe a device, or mint a successor that
+        survives revoking the original.
+
+        Carries one of three cumulative scopes: `read`, `write` (implies read),
+        `delete` (implies both). Revocation takes effect on the next request.
+
+        Send it in the `Authorization` header and nowhere else. A credential in
+        a query string is written to this server's access log and to every proxy
+        in front of it.
+
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      description: Page size. Default 50, hard maximum 200 — there is no "return everything" mode.
+      schema:
+        type: integer
+        default: 50
+        maximum: 200
+    Offset:
+      name: offset
+      in: query
+      schema:
+        type: integer
+        default: 0
+    ItemId:
+      name: itemId
+      in: path
+      required: true
+      schema:
+        type: string
+    SubitemId:
+      name: subitemId
+      in: path
+      required: true
+      schema:
+        type: string
+    TaskCompleted:
+      name: completed
+      in: query
+      schema:
+        type: boolean
+    TaskDueBefore:
+      name: due_before
+      in: query
+      description: RFC3339 UTC to the second
+      schema:
+        type: string
+    TaskDueAfter:
+      name: due_after
+      in: query
+      schema:
+        type: string
+    TaskOverdue:
+      name: overdue
+      in: query
+      description: Only tasks past their due date and not yet completed
+      schema:
+        type: boolean
+    TaskImportanceMin:
+      name: importance_min
+      in: query
+      schema:
+        type: integer
+        minimum: 0
+        maximum: 4
+
+  responses:
+    Unauthorized:
+      description: Missing, malformed, expired or revoked credential
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: |
+        Not found. Deliberately the same answer for something that does not
+        exist, something belonging to another account, something soft-deleted,
+        and a list closed to the API — telling them apart confirms the thing
+        exists.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    BadRequest:
+      description: The request body or parameters were not usable
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ScopeInsufficient:
+      description: |
+        The token is valid but was created without enough scope. The fix is a new
+        token rather than signing in again, which is why this is 403 and not 401.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: This app token is read-only. Create a token with write access to do this.
+            code: scope_insufficient
+    AppAPIDisabled:
+      description: |
+        App tokens are switched off for this whole installation by its
+        administrator. Nothing is wrong with the credential and creating a new
+        one will not help — which is why this is 503 rather than 401 or 403. The
+        token is not revoked and resumes when the feature is switched back on.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: App tokens are turned off on this server. Ask whoever administers it.
+            code: app_api_disabled
+    RateLimited:
+      description: |
+        This token has spent its budget. `Retry-After` says how many seconds to
+        wait.
+
+        Budgets are per token: roughly 600 reads and 60 writes a minute, with a
+        small burst. Limits are in-process, so they reset when the server
+        restarts and are not shared between replicas.
+      headers:
+        Retry-After:
+          schema:
+            type: integer
+          description: Seconds to wait
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    TaskPage:
+      description: A page of tasks
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              items:
+                type: array
+                items:
+                  $ref: '#/components/schemas/PersonalTask'
+              total:
+                type: integer
+                description: Matches in total, so a caller can tell a page from the whole set
+              limit:
+                type: integer
+              offset:
+                type: integer
+
+  schemas:
+    AppToken:
+      type: object
+      description: A stored app token, without its secret — which is unrecoverable.
+      properties:
+        id:
+          type: string
+          description: |
+            Also the device id this token's writes are attributed to. There is no
+            row for it in `devices`: the identity is real for attribution and
+            last-write-wins, and belongs to no hardware.
+        name:
+          type: string
+        prefix:
+          type: string
+          description: The first characters of the secret, so a list can tell tokens apart
+          example: oxt_7Kd2Qa
+        scope:
+          type: string
+          enum: [read, write, delete]
+        created_at:
+          type: string
+        expires_at:
+          type: string
+          description: Absent when the token does not expire, which is the default
+        last_used_at:
+          type: string
+          description: Absent when nothing has used it yet — usually a config pasted wrong
+        last_used_ip:
+          type: string
+          description: |
+            The address the request came from. Only taken from `X-Forwarded-For`
+            when the deployment sets `TRUSTED_PROXY`, because otherwise that
+            header is written by the client.
+        revoked_at:
+          type: string
+          description: Present once revoked. Revoked tokens stay listed.
+
+    PersonalList:
+      type: object
+      description: |
+        One of your own lists. Read-only over this API — there is no endpoint
+        that creates, renames, archives or deletes one.
+      properties:
+        id:
+          type: string
+        title:
+          type: string
+        color:
+          type: string
+        icon:
+          type: string
+        default_note_type:
+          type: string
+          enum: [todo, note]
+        is_archived:
+          type: boolean
+        open_tasks:
+          type: integer
+        total_tasks:
+          type: integer
+        created_at:
+          type: string
+        updated_at:
+          type: string
+
+    PersonalTask:
+      type: object
+      properties:
+        id:
+          type: string
+        list_id:
+          type: string
+        title:
+          type: string
+        content:
+          type: string
+          description: |
+            Truncated in list and search responses; whole only from
+            `GET /personal/items/{itemId}`.
+        content_truncated:
+          type: boolean
+          description: Present and true when `content` is a preview
+        note_type:
+          type: string
+          enum: [todo, note]
+        importance:
+          type: integer
+          minimum: 0
+          maximum: 4
+          description: |
+            Normalised on read. SQLite could not add this constraint to databases
+            that were upgraded rather than created, so stored values are clamped
+            rather than trusted.
+        is_completed:
+          type: boolean
+        completed_at:
+          type: string
+        due_at:
+          type: string
+        is_pinned:
+          type: boolean
+        attachment_count:
+          type: integer
+          description: |
+            A count and nothing else. File access is out of scope for app tokens,
+            and a filename is content.
+        created_at:
+          type: string
+        updated_at:
+          type: string
+        subitems:
+          type: array
+          description: Only populated when fetching a single task by id
+          items:
+            $ref: '#/components/schemas/PersonalSubtask'
+
+    PersonalSubtask:
+      type: object
+      properties:
+        id:
+          type: string
+        item_id:
+          type: string
+        title:
+          type: string
+        is_completed:
+          type: boolean
+        completed_at:
+          type: string
+        created_at:
+          type: string
+        updated_at:
+          type: string
+
+    # Authentication schemas
+    LoginRequest:
+      type: object
+      required:
+        - identifier
+        - password
+        - device_name
+        - device_type
+      properties:
+        identifier:
+          type: string
+          description: Username or email address
+          example: "johndoe"
+        password:
+          type: string
+          example: "securepassword123"
+        device_name:
+          type: string
+          example: "John's iPhone"
+        device_type:
+          type: string
+          enum: [mobile, tablet, desktop, web, server]
+          example: "mobile"
+        totp_code:
+          type: string
+          description: TOTP code for 2FA (if enabled)
+          pattern: '^[0-9]{6}$'
+          example: "123456"
+
+    LoginResponse:
+      type: object
+      properties:
+        access_token:
+          type: string
+        refresh_token:
+          type: string
+        expires_in:
+          type: integer
+          description: Access token expiry in seconds
+          example: 86400
+        user_id:
+          type: string
+          format: uuid
+        device_id:
+          type: string
+          format: uuid
+
+    RefreshRequest:
+      type: object
+      required:
+        - refresh_token
+      properties:
+        refresh_token:
+          type: string
+
+    RefreshResponse:
+      type: object
+      properties:
+        access_token:
+          type: string
+        expires_in:
+          type: integer
+          description: Access token expiry in seconds
+          example: 86400
+
+    SearchUsersResponse:
+      type: object
+      properties:
+        users:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserSearchResult'
+
+    UserSearchResult:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        username:
+          type: string
+        email:
+          type: string
+          format: email
+
+    # Device schemas
+    GetDevicesResponse:
+      type: object
+      properties:
+        devices:
+          type: array
+          items:
+            $ref: '#/components/schemas/Device'
+
+    Device:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        user_id:
+          type: string
+          format: uuid
+        device_name:
+          type: string
+        device_type:
+          type: string
+          enum: [mobile, tablet, desktop, web, server]
+        public_key:
+          type: string
+          nullable: true
+        key_enabled:
+          type: boolean
+        last_seen_at:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        created_by_user_id:
+          type: string
+          format: uuid
+        created_by_device_id:
+          type: string
+          format: uuid
+        updated_by_user_id:
+          type: string
+          format: uuid
+        updated_by_device_id:
+          type: string
+          format: uuid
+        is_active:
+          type: boolean
+        is_deleted:
+          type: boolean
+        deleted_at:
+          type: string
+          format: date-time
+          nullable: true
+        deleted_by_user_id:
+          type: string
+          format: uuid
+          nullable: true
+        deleted_by_device_id:
+          type: string
+          format: uuid
+          nullable: true
+
+    RegisterDeviceRequest:
+      type: object
+      required:
+        - device_name
+        - device_type
+      properties:
+        device_name:
+          type: string
+          minLength: 1
+          maxLength: 100
+          example: "Work Laptop"
+        device_type:
+          type: string
+          enum: [mobile, tablet, desktop, web, server]
+          example: "desktop"
+        public_key:
+          type: string
+          description: Optional public key for device encryption
+
+    RegisterDeviceResponse:
+      type: object
+      properties:
+        device_id:
+          type: string
+          format: uuid
+        device_name:
+          type: string
+        device_type:
+          type: string
+
+    UpdateDeviceRequest:
+      type: object
+      required:
+        - device_name
+        - device_type
+      properties:
+        device_name:
+          type: string
+          minLength: 1
+          maxLength: 100
+        device_type:
+          type: string
+          enum: [mobile, tablet, desktop, web, server]
+        public_key:
+          type: string
+          description: Optional public key for device encryption
+
+    UpdateDeviceResponse:
+      type: object
+      properties:
+        device_id:
+          type: string
+          format: uuid
+        device_name:
+          type: string
+        device_type:
+          type: string
+
+    # Sync schemas
+    SyncResponse:
+      type: object
+      properties:
+        records:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+            description: Dynamic record based on table type
+        server_time:
+          type: string
+          format: date-time
+        has_more:
+          type: boolean
+          description: Whether there are more records to fetch
+        next_cursor:
+          type: string
+          description: Cursor for pagination (if has_more is true)
+
+    ApplyRequest:
+      type: object
+      required:
+        - records
+        - device_id
+        - last_sync
+      properties:
+        records:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+            description: Records to apply (format depends on table type)
+        device_id:
+          type: string
+          format: uuid
+          description: Device ID making the changes
+        last_sync:
+          type: string
+          format: date-time
+          description: Last sync timestamp for conflict resolution
+
+    ApplyResponse:
+      type: object
+      properties:
+        applied:
+          type: integer
+          description: Number of records successfully applied
+        conflicts:
+          type: array
+          items:
+            $ref: '#/components/schemas/Conflict'
+          description: List of conflicts that occurred during apply
+        server_time:
+          type: string
+          format: date-time
+
+    Conflict:
+      type: object
+      properties:
+        record_id:
+          type: string
+          description: ID of the conflicted record
+        local_record:
+          type: object
+          additionalProperties: true
+          description: The local record that was sent
+        server_record:
+          type: object
+          additionalProperties: true
+          description: The current server record
+        resolution:
+          type: string
+          enum: [client_wins, server_wins, access_denied, error]
+          description: How the conflict was resolved
+
+    # Invitation schemas
+    PendingInvitationsResponse:
+      type: object
+      properties:
+        invitations:
+          type: array
+          items:
+            $ref: '#/components/schemas/PendingInvitation'
+
+    PendingInvitation:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        list_id:
+          type: string
+          format: uuid
+        list_title:
+          type: string
+        permission:
+          type: string
+          enum: [read, write, admin]
+        granted_by:
+          type: string
+          format: uuid
+          description: User ID who sent the invitation
+        granted_by_name:
+          type: string
+          description: Username of who sent the invitation
+        granted_at:
+          type: string
+          format: date-time
+
+    SentInvitationsResponse:
+      type: object
+      properties:
+        invitations:
+          type: array
+          items:
+            $ref: '#/components/schemas/SentInvitation'
+
+    SentInvitation:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+        list_id:
+          type: string
+          format: uuid
+        list_title:
+          type: string
+        invitee_email:
+          type: string
+          format: email
+        permission:
+          type: string
+          enum: [read, write, admin]
+        invitation_status:
+          type: string
+          enum: [pending, accepted, declined]
+        granted_at:
+          type: string
+          format: date-time
+
+    InviteRequest:
+      type: object
+      required:
+        - invitee_email
+        - permission
+      properties:
+        invitee_email:
+          type: string
+          format: email
+          description: Email address of the user to invite
+        permission:
+          type: string
+          enum: [read, write, admin]
+          description: Permission level to grant
+
+    InviteResponse:
+      type: object
+      properties:
+        invitation_id:
+          type: string
+          format: uuid
+        message:
+          type: string
+          example: "Invitation sent successfully"
+
+    # Common schemas
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Error message
+        code:
+          type: string
+          description: Error code (optional)
+        details:
+          type: object
+          additionalProperties: true
+          description: Additional error details (optional)
+
+    File:
+      type: object
+      description: An attachment's metadata. The bytes live behind /files/{id}/download.
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Also the filename the bytes are stored under
+        original_filename:
+          type: string
+          description: The name the file had when it was picked
+        file_size:
+          type: integer
+          format: int64
+        file_hash:
+          type: string
+          description: SHA-256 of the contents
+        mime_type:
+          type: string
+          description: The catalogue's canonical type, decided from extension and content
+          example: application/pdf
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        created_by_user_id:
+          type: string
+        created_by_device_id:
+          type: string
+        updated_by_user_id:
+          type: string
+        updated_by_device_id:
+          type: string
+        is_deleted:
+          type: boolean
+
+    # Data model schemas for sync operations
+    ListRecord:
+      type: object
+      description: List record for sync operations
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        color:
+          type: string
+          pattern: '^#[0-9A-Fa-f]{6}$'
+          default: "#000000"
+        icon:
+          type: string
+          nullable: true
+        sort_order:
+          type: integer
+          default: 0
+        owner_user_id:
+          type: string
+          format: uuid
+        is_shared:
+          type: boolean
+          default: false
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        created_by_user_id:
+          type: string
+          format: uuid
+        created_by_device_id:
+          type: string
+          format: uuid
+        updated_by_user_id:
+          type: string
+          format: uuid
+        updated_by_device_id:
+          type: string
+          format: uuid
+        is_deleted:
+          type: boolean
+          default: false
+        deleted_at:
+          type: string
+          format: date-time
+          nullable: true
+        deleted_by_user_id:
+          type: string
+          format: uuid
+          nullable: true
+        deleted_by_device_id:
+          type: string
+          format: uuid
+          nullable: true
+
+    ItemRecord:
+      type: object
+      description: Item record for sync operations
+      properties:
+        id:
+          type: string
+          format: uuid
+        list_id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        content:
+          type: string
+          nullable: true
+        note_type:
+          type: string
+          enum: [todo, note, event]
+          default: "todo"
+        icon:
+          type: string
+          nullable: true
+        weight:
+          type: integer
+          default: 0
+        is_pinned:
+          type: boolean
+          default: false
+        is_completed:
+          type: boolean
+          default: false
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+        completed_by_user_id:
+          type: string
+          format: uuid
+          nullable: true
+        completed_by_device_id:
+          type: string
+          format: uuid
+          nullable: true
+        todo_timestamp:
+          type: string
+          format: date-time
+          nullable: true
+        reminder:
+          type: boolean
+          default: false
+        reminder_before:
+          type: string
+          nullable: true
+        reminder_sent:
+          type: boolean
+          default: false
+        repeat_pattern:
+          type: string
+          default: ""
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        created_by_user_id:
+          type: string
+          format: uuid
+        created_by_device_id:
+          type: string
+          format: uuid
+        updated_by_user_id:
+          type: string
+          format: uuid
+        updated_by_device_id:
+          type: string
+          format: uuid
+        is_deleted:
+          type: boolean
+          default: false
+        deleted_at:
+          type: string
+          format: date-time
+          nullable: true
+        deleted_by_user_id:
+          type: string
+          format: uuid
+          nullable: true
+        deleted_by_device_id:
+          type: string
+          format: uuid
+          nullable: true
+
+    SubitemRecord:
+      type: object
+      description: Subitem record for sync operations
+      properties:
+        id:
+          type: string
+          format: uuid
+        item_id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        is_completed:
+          type: boolean
+          default: false
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+        completed_by_user_id:
+          type: string
+          format: uuid
+          nullable: true
+        completed_by_device_id:
+          type: string
+          format: uuid
+          nullable: true
+        sort_order:
+          type: integer
+          default: 0
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        created_by_user_id:
+          type: string
+          format: uuid
+        created_by_device_id:
+          type: string
+          format: uuid
+        updated_by_user_id:
+          type: string
+          format: uuid
+        updated_by_device_id:
+          type: string
+          format: uuid
+        is_deleted:
+          type: boolean
+          default: false
+        deleted_at:
+          type: string
+          format: date-time
+          nullable: true
+        deleted_by_user_id:
+          type: string
+          format: uuid
+          nullable: true
+        deleted_by_device_id:
+          type: string
+          format: uuid
+          nullable: true
+
+    TagRecord:
+      type: object
+      description: Tag record for sync operations
+      properties:
+        id:
+          type: string
+          format: uuid
+        title:
+          type: string
+        color:
+          type: string
+          pattern: '^#[0-9A-Fa-f]{6}$'
+        owner_user_id:
+          type: string
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        created_by_user_id:
+          type: string
+          format: uuid
+        created_by_device_id:
+          type: string
+          format: uuid
+        updated_by_user_id:
+          type: string
+          format: uuid
+        updated_by_device_id:
+          type: string
+          format: uuid
+        is_deleted:
+          type: boolean
+          default: false
+        deleted_at:
+          type: string
+          format: date-time
+          nullable: true
+        deleted_by_user_id:
+          type: string
+          format: uuid
+          nullable: true
+        deleted_by_device_id:
+          type: string
+          format: uuid
+          nullable: true
+
+    ItemTagRecord:
+      type: object
+      description: Item-Tag relationship record for sync operations
+      properties:
+        id:
+          type: string
+          format: uuid
+        item_id:
+          type: string
+          format: uuid
+        tag_id:
+          type: string
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+        created_by_user_id:
+          type: string
+          format: uuid
+        created_by_device_id:
+          type: string
+          format: uuid
+        is_deleted:
+          type: boolean
+          default: false
+        deleted_at:
+          type: string
+          format: date-time
+          nullable: true
+        deleted_by_user_id:
+          type: string
+          format: uuid
+          nullable: true
+        deleted_by_device_id:
+          type: string
+          format: uuid
+          nullable: true
