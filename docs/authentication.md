@@ -32,7 +32,7 @@ What an AI assistant or a script uses. Created in the app, not over the API — 
 [app tokens](app-tokens.md).
 
 ```
-Authorization: Bearer oxt_7Kd2QaX8vN3mPqR5tY9wZ1bC4eF6gH0jK2lM8nO4pQs
+Authorization: Bearer oxt_EXAMPLE000000000000000000000000000000000
 ```
 
 Accepted **only** on `/api/v1/personal/*`. Deliberately weaker than a session in

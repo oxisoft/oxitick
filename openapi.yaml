@@ -937,7 +937,7 @@ paths:
                   secret:
                     type: string
                     description: The credential itself. Store it now.
-                    example: oxt_7Kd2QaX8vN3mPqR5tY9wZ1bC4eF6gH0jK2lM8nO4pQs
+                    example: oxt_EXAMPLE000000000000000000000000000000000
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
